@@ -1,0 +1,187 @@
+name: Build and Release
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    # branches:
+    #   - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # Build the app on macOS.
+  # push/PR -> compile check + app zip artifact (for manual testing)
+  # tag v*  -> ad-hoc signed Release build -> DMG -> artifact for the release job
+  build:
+    name: Build (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # FinderSync 扩展沙盒进程需要 Team 签名才有 App Group 容器的写权限：
+      # ad-hoc 签名时扩展能读组容器但写入 EPERM（POSIX Code=1），「访达右键打开终端」
+      # 等依赖扩展→主app IPC 的功能会静默失败。CI 从 secrets 导入 Apple Development
+      # 证书签名；未配置证书时回退 ad-hoc（fork PR 拿不到 secrets，仅编译检查用）。
+      - name: Import signing certificate
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BUILD_CERTIFICATE_BASE64:-}" ]; then
+            echo "::warning::未配置 BUILD_CERTIFICATE_BASE64，回退 ad-hoc 签名（FinderSync 扩展将无 App Group 写权限）"
+            echo "CS_IDENTITY=-" >> "$GITHUB_ENV"
+            echo "CS_TEAM=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KC_PATH="$RUNNER_TEMP/build.keychain-db"
+          KC_PASS="$(openssl rand -hex 16)"
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+          security create-keychain -p "$KC_PASS" "$KC_PATH"
+          security set-keychain-settings -lut 21600 "$KC_PATH"
+          security unlock-keychain -p "$KC_PASS" "$KC_PATH"
+          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KC_PATH"
+          # 校验私钥真的进来了:p12 只导出证书没带私钥时(常见坑)这里为 0,
+          # 否则后续 set-key-partition-list 只报隐晦的 SecItemCopyMatching
+          COUNT="$(security find-identity -v -p codesigning "$KC_PATH" | awk '/valid identities found/ {print $1}')"
+          if [ "${COUNT:-0}" -eq 0 ]; then
+            echo "::error::keychain 里没有可签名的身份——导出的 p12 大概率没带私钥。请在钥匙串访问「我的证书」里展开证书条目确认有「专用密钥」,连私钥一起导出 .p12 后更新 secret;若私钥不可导出(Xcode 生成于其它机器),在 Xcode → Accounts → Manage Certificates 新建证书后重新导出"
+            exit 1
+          fi
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KC_PATH"
+          security list-keychain -d user -s "$KC_PATH" login.keychain
+          echo "CS_IDENTITY=Apple Development" >> "$GITHUB_ENV"
+          echo "CS_TEAM=8NHN73Q43T" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Zeroflow.xcodeproj \
+            -scheme Zeroflow \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="$CS_IDENTITY" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$CS_TEAM" \
+            build
+
+      # The product path is not always deterministic (may land in
+      # ArchiveIntermediates), so locate it and export APP_PATH.
+      - name: Locate app bundle
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release/Zeroflow.app"
+          if [ ! -d "$APP" ]; then
+            APP="$(find build/Build -type d -name 'Zeroflow.app' -path '*Release*' | head -n 1)"
+          fi
+          if [ ! -d "$APP" ]; then
+            echo "::error::Zeroflow.app not found under build/Build"
+            exit 1
+          fi
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+
+      - name: Verify code signature
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict "$APP_PATH"
+          codesign -dv "$APP_PATH/Contents/PlugIns/FinderSyncExtension.appex"
+          # 发 Release 的包必须带 Team 签名，否则扩展沙盒无 App Group 写权限
+          if [ -n "${CS_TEAM:-}" ]; then
+            codesign -dv "$APP_PATH/Contents/PlugIns/FinderSyncExtension.appex" 2>&1 \
+              | grep -q "TeamIdentifier=$CS_TEAM" \
+              || { echo "::error::appex 未按 Team 签名，沙盒下 App Group 写入会被拒（打开终端功能会失效）"; exit 1; }
+          fi
+
+      - name: Package app zip
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: ditto -c -k --keepParent --sequesterRsrc "$APP_PATH" Zeroflow-macos.zip
+
+      - name: Upload app artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: Zeroflow-macos
+          path: Zeroflow-macos.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Install create-dmg
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: brew install create-dmg
+
+      - name: Create DMG
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGING="staging"
+          mkdir -p "$STAGING"
+          ditto "$APP_PATH" "$STAGING/Zeroflow.app"
+          create-dmg \
+            --volname "Zeroflow $VERSION" \
+            --background dmg_bg.png \
+            --window-size 660 400 \
+            --icon-size 128 \
+            --icon "Zeroflow.app" 160 146 \
+            --app-drop-link 500 146 \
+            --hide-extension "Zeroflow.app" \
+            "Zeroflow-$VERSION.dmg" \
+            "$STAGING"
+
+      - name: Upload DMG artifact
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: Zeroflow-dmg
+          path: Zeroflow-*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  # Create GitHub Release when a version tag is pushed
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Zeroflow ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            ## 安装
+
+            1. 下载 `Zeroflow-*.dmg`，打开后将 Zeroflow 拖入「应用程序」。
+            2. 应用未做开发者签名/公证，首次打开若提示「已损坏，无法打开」或「无法验证开发者」，任选其一：
+               - 前往 系统设置 → 隐私与安全性 → 点击「仍要打开」。
+               - 或终端执行 `xattr -cr /Applications/Zeroflow.app` 后再打开；
+          files: |
+            artifacts/**/*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
