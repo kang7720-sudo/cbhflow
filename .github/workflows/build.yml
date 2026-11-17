@@ -27,11 +27,11 @@ jobs:
         run: |
           APP=$(find build/Build -name "Zeroflow.app" | head -n 1)
           mkdir -p dist
-          cp -R -L "$APP" dist/
-          hdiutil create -volname "Zeroflow" -srcfolder dist -ov -format UDZO "Zeroflow-${GITHUB_REF_NAME}.dmg"
+          cp -R -L "$APP" dist/cbhflow.app
+          hdiutil create -volname "cbhflow" -srcfolder dist -ov -format UDZO "cbhflow-${GITHUB_REF_NAME}.dmg"
 
       - name: Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: Zeroflow-*.dmg
+          files: cbhflow-*.dmg
