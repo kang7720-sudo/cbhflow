@@ -30,27 +30,34 @@ jobs:
             -scheme Zeroflow \
             -configuration Release \
             -derivedDataPath build \
+            PRODUCT_NAME=cbhflow \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM= \
             build
 
-      - name: Package App & DMG
+      - name: Package Standard DMG
         run: |
           set -euo pipefail
-          APP=$(find build/Build -name "Zeroflow.app" | head -n 1)
-          mkdir -p dist
-          cp -R -L "$APP" dist/cbhflow.app
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName cbhflow" dist/cbhflow.app/Contents/Info.plist 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string cbhflow" dist/cbhflow.app/Contents/Info.plist
-          hdiutil create -volname "cbhflow" -srcfolder dist -ov -format UDZO "cbhflow-${GITHUB_REF_NAME}.dmg"
+          APP=$(find build/Build -name "cbhflow.app" | head -n 1)
+          mkdir -p dmg_stage
+          cp -R -L "$APP" dmg_stage/cbhflow.app
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName cbhflow" dmg_stage/cbhflow.app/Contents/Info.plist 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string cbhflow" dmg_stage/cbhflow.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName cbhflow" dmg_stage/cbhflow.app/Contents/Info.plist 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleName string cbhflow" dmg_stage/cbhflow.app/Contents/Info.plist
+          # 深度重签名，确保修改 Info.plist 后捆绑包签名完整有效（解决辅助功能权限识别问题）
+          codesign --force --deep --sign - dmg_stage/cbhflow.app
+          # 创建「应用程序」替身链接，实现标准拖拽安装
+          ln -s /Applications dmg_stage/Applications
+          hdiutil create -volname "cbhflow" -srcfolder dmg_stage -ov -format UDZO "cbhflow-${GITHUB_REF_NAME}.dmg"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: cbhflow-macos-${{ github.ref_name }}
           path: |
-            dist/cbhflow.app
+            dmg_stage/cbhflow.app
             cbhflow-*.dmg
 
       - name: Release
