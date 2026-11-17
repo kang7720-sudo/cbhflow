@@ -1,0 +1,60 @@
+name: Build and Release
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Zeroflow.xcodeproj \
+            -scheme Zeroflow \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM= \
+            build
+
+      - name: Package App & DMG
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build -name "Zeroflow.app" | head -n 1)
+          mkdir -p dist
+          cp -R -L "$APP" dist/cbhflow.app
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName cbhflow" dist/cbhflow.app/Contents/Info.plist 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string cbhflow" dist/cbhflow.app/Contents/Info.plist
+          hdiutil create -volname "cbhflow" -srcfolder dist -ov -format UDZO "cbhflow-${GITHUB_REF_NAME}.dmg"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cbhflow-macos-${{ github.ref_name }}
+          path: |
+            dist/cbhflow.app
+            cbhflow-*.dmg
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: cbhflow-*.dmg
